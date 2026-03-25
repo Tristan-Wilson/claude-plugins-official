@@ -1103,6 +1103,7 @@ void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
+        allowed_updates: ['message', 'message_reaction', 'channel_post'],
         onStart: info => {
           attempt = 0
           botUsername = info.username
