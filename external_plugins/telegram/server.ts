@@ -22,6 +22,12 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import {
+  botBusHeader,
+  escapeMarkdownV2Literal,
+  routeBotBus,
+  type BotBusConfig,
+} from './botbus.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -119,6 +125,8 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /** Optional authenticated routing policy for one private Telegram bot-bus channel. */
+  botBus?: BotBusConfig
 }
 
 function defaultAccess(): Access {
@@ -165,6 +173,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      botBus: parsed.botBus,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -419,9 +428,9 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. Authenticated bot-bus messages also include botbus_from, botbus_role, botbus_to, and botbus_verified attributes; author_signature is display metadata only. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. On a configured bot-bus chat, pass recipients (agent ids or ["*"]) so every text chunk and attachment carries the routing header. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -469,7 +478,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, files (absolute paths), and bot-bus recipients.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -483,6 +492,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'string' },
             description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
+          },
+          recipients: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional bot-bus recipients. Use configured agent ids, or ["*"] for all. The bridge repeats the routing header on every chunk and attachment.',
           },
           format: {
             type: 'string',
@@ -547,6 +561,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
+        const rawRecipients = args.recipients
+        if (rawRecipients != null && (!Array.isArray(rawRecipients) || rawRecipients.some(v => typeof v !== 'string'))) {
+          throw new Error('recipients must be an array of strings')
+        }
+        const recipients = (rawRecipients as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
 
@@ -564,7 +583,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        const header = botBusHeader(access.botBus, chat_id, recipients)
+        const wireHeader = header && parseMode ? escapeMarkdownV2Literal(header) : header
+        const bodyLimit = wireHeader ? limit - wireHeader.length - 1 : limit
+        if (bodyLimit < 1) throw new Error('bot-bus routing header exceeds text chunk limit')
+        const chunks = chunk(text, bodyLimit, mode)
         const sentIds: number[] = []
 
         try {
@@ -573,7 +596,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
-            const sent = await bot.api.sendMessage(chat_id, chunks[i], {
+            const body = chunks[i]
+            const routedText = wireHeader ? `${wireHeader}\n${body}` : body
+            const sent = await bot.api.sendMessage(chat_id, routedText, {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
             })
@@ -591,9 +616,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+          const opts = {
+            ...(reply_to != null && replyMode !== 'off'
+              ? { reply_parameters: { message_id: reply_to } }
+              : {}),
+            ...(header ? { caption: header } : {}),
+          }
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
@@ -1022,6 +1050,19 @@ async function handleInbound(
   const chat_id = String(ctx.chat!.id)
   const msg = ctx.message ?? ctx.channelPost
   const msgId = msg?.message_id
+  const senderChatId = msg?.sender_chat ? String(msg.sender_chat.id) : undefined
+  const route = routeBotBus(access.botBus, {
+    chatId: chat_id,
+    fromId: from ? String(from.id) : undefined,
+    senderChatId,
+    text,
+    authorSignature: msg?.author_signature,
+  })
+  if (route.applies && !route.deliver) {
+    process.stderr.write(`telegram channel: bot-bus drop (${route.reason ?? 'unknown'})\n`)
+    return
+  }
+  text = route.content
 
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
@@ -1070,9 +1111,20 @@ async function handleInbound(
       meta: {
         chat_id,
         ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from?.username ?? (from ? String(from.id) : `channel:${chat_id}`),
+        user: route.applies
+          ? route.senderName!
+          : from?.username ?? (from ? String(from.id) : `channel:${chat_id}`),
         ...(from ? { user_id: String(from.id) } : {}),
         ts: new Date((msg?.date ?? 0) * 1000).toISOString(),
+        ...(senderChatId ? { sender_chat_id: senderChatId } : {}),
+        ...(msg?.author_signature ? { author_signature: msg.author_signature } : {}),
+        ...(route.applies ? {
+          botbus_from: route.senderName!,
+          botbus_role: route.senderRole!,
+          botbus_to: route.recipients!,
+          botbus_verified: 'true',
+          botbus_route: route.fallback ? 'fallback' : 'header',
+        } : {}),
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
           attachment_kind: attachment.kind,
