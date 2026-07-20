@@ -92,6 +92,38 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 
 **`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
 
+## Private bot bus
+
+An optional `botBus` policy turns one allowlisted private channel into an
+authenticated, addressed bus for multiple assistants. Existing installations
+are unchanged when `botBus` is absent.
+
+The first line routes a message to one agent, several agents, or all agents:
+
+```text
+[botbus:v1 to=agent-a]
+[botbus:v1 to=agent-a,agent-b]
+[botbus:v1 to=*]
+```
+
+Sender trust comes from Telegram's stable `from.id`, mapped through the
+operator-owned `principals` roster. Only when `from` is absent may
+`sender_chat.id` select a `sender_chat:<id>` principal. Telegram's visible
+`author_signature` is forwarded as display metadata but never authenticates a
+sender.
+
+A valid header is stripped before delivery. Unknown senders, malformed
+`[botbus:` headers, unknown recipients, and messages for other agents are
+dropped before attachment downloads, typing indicators, reactions, or model
+delivery. Messages with no routing-looking header follow the authenticated
+sender role's `unaddressed` policy; this allows trusted administrators to post
+manually and supports migration from legacy broadcasts.
+
+The `reply` tool accepts an optional `recipients` array on the configured bus.
+It repeats the generated header on every text chunk and attachment caption so
+each Telegram message is independently routable. Omit `recipients` for an
+unaddressed message.
+
 ## Skill reference
 
 | Command | Effect |
@@ -142,6 +174,23 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
   "textChunkLimit": 4096,
 
   // length = cut at limit. newline = prefer paragraph boundaries.
-  "chunkMode": "newline"
+  "chunkMode": "newline",
+
+  // Optional authenticated routing for one allowlisted private channel.
+  // Keep the real roster in private operator configuration.
+  "botBus": {
+    "channelId": "-1009000",
+    "self": "agent-b",
+    "agents": ["agent-a", "agent-b", "agent-c"],
+    "principals": {
+      "user:1001": { "name": "agent-a", "role": "agent" },
+      "user:2001": { "name": "admin-one", "role": "human-admin" },
+      "sender_chat:-9001": { "name": "admin-channel", "role": "human-admin" }
+    },
+    "unaddressed": {
+      "agent": "broadcast",
+      "human-admin": "broadcast"
+    }
+  }
 }
 ```
